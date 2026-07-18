@@ -66,7 +66,9 @@ def build() -> dict:
     install_cell = code_cell(
         "!pip install --no-index --find-links \\\n"
         "    /kaggle/input/competitions/arc-prize-2026-arc-agi-3/arc_agi_3_wheels \\\n"
-        "    arc-agi python-dotenv"
+        "    arc-agi python-dotenv\n"
+        "!pip install --no-index --find-links /kaggle/input/vllm-offline-wheels vllm\n"
+        "!pip install openai"
     )
 
     # We write the agent to /tmp/ (not /kaggle/working/) so it does NOT appear
@@ -151,6 +153,47 @@ def build() -> dict:
         )
     )
 
+    vllm_start_cell = code_cell(
+        dedent(
+            """\
+            import os
+            import subprocess
+            import time
+            import socket
+
+            if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
+                print("Starting vLLM server in background...")
+                # Assuming model dataset is mounted at /kaggle/input/qwen-2-5-coder-7b-instruct
+                model_path = "/kaggle/input/qwen-2-5-coder-7b-instruct"
+                
+                vllm_cmd = [
+                    "python", "-m", "vllm.entrypoints.openai.api_server",
+                    "--model", model_path,
+                    "--served-model-name", "qwen-coder",
+                    "--max-model-len", "8192",
+                    "--gpu-memory-utilization", "0.90",
+                    "--port", "8000"
+                ]
+                
+                vllm_process = subprocess.Popen(
+                    vllm_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                
+                print("Waiting for vLLM server on port 8000...")
+                start_time = time.time()
+                while time.time() - start_time < 300: # Wait up to 5 mins
+                    try:
+                        with socket.create_connection(("localhost", 8000), timeout=1):
+                            print("vLLM Server is up!")
+                            break
+                    except OSError:
+                        time.sleep(5)
+                else:
+                    print("Timeout waiting for vLLM server!")
+            """
+        )
+    )
+
     if ACCELERATOR not in _ACCELERATORS:
         raise SystemExit(
             f"Unknown ACCELERATOR={ACCELERATOR!r}. Pick one of: "
@@ -190,6 +233,7 @@ def build() -> dict:
             ),
             install_cell,
             write_agent_cell,
+            vllm_start_cell,
             run_cell,
             dummy_submission_cell,
         ],

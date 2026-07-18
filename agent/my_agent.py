@@ -1,87 +1,207 @@
-"""Your ARC-AGI-3 agent. This is the *only* file you should normally edit.
-
-`scripts/build_notebook.py` splices the contents of this file into the
-Kaggle submission notebook, so your local dev loop and your Kaggle
-submission stay in lock-step:
-
-    [edit my_agent.py] → [make play-local] → [make submit]
-
-The default body below is a port of the Stochastic Goose / random_agent
-sample — a known-good baseline that produces a valid submission and
-proves your end-to-end pipeline works. Replace `choose_action` with your
-real strategy.
-
-Contract (enforced by the ARC-AGI-3-Agents framework):
-  - Subclass `agents.agent.Agent`.
-  - Class must be named `MyAgent` (the notebook's __init__.py registers it).
-  - Implement `is_done(frames, latest_frame) -> bool`.
-  - Implement `choose_action(frames, latest_frame) -> GameAction`.
-"""
 from __future__ import annotations
 
-import random
-import time
-from typing import Any
+import json
+import logging
+import os
+import textwrap
+from typing import Any, Optional
 
+import openai
 from arcengine import FrameData, GameAction, GameState
+from openai import OpenAI as OpenAIClient
 
 # When run inside the ARC-AGI-3-Agents framework (locally or on Kaggle)
-# the `agents` package is on sys.path, so this import resolves.
 from agents.agent import Agent
 
+logger = logging.getLogger(__name__)
 
 class MyAgent(Agent):
-    """Picks legal actions uniformly at random. Replace with your strategy."""
+    """An LLM-driven agent optimized for offline Kaggle evaluation with Qwen 2.5 Coder."""
 
-    # Upper bound on actions per game; the framework also enforces global limits.
     MAX_ACTIONS = 80
+    MODEL = "qwen-coder"
+    MESSAGE_LIMIT = 20
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        # Seed per game_id so replays from the same game are reproducible but
-        # different games explore independently.
-        seed = int(time.time() * 1_000_000) + hash(self.game_id) % 1_000_000
-        random.seed(seed)
+        self.messages: list[dict[str, Any]] = []
+        self.episodic_memory: list[str] = []
+        self.token_counter = 0
 
     @property
     def name(self) -> str:
-        return f"{super().name}.{self.MAX_ACTIONS}"
+        return f"{super().name}.{self.MODEL}.agentic"
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
-        # Stop once we win. Don't stop on GAME_OVER — we want to RESET and retry.
         return latest_frame.state is GameState.WIN
+
+    def _get_client(self):
+        # Point to the local vLLM server running in the Kaggle notebook background
+        base_url = os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
+        # Ensure we have a dummy API key for vLLM
+        api_key = os.environ.get("OPENAI_API_KEY", "test-key-123")
+        return OpenAIClient(api_key=api_key, base_url=base_url)
 
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
-        # First call or after a death → reset the level.
+        client = self._get_client()
+
+        # Handle RESET manually
         if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
+            self.messages = [] # clear context on reset
+            self.episodic_memory.append(f"Level ended with state: {latest_frame.state.name}. Score: {latest_frame.levels_completed}")
             return GameAction.RESET
 
-        # ── Per-game strategy fork ───────────────────────────────────────────
-        # By default every game uses the same uniformly-random strategy in the
-        # `else` branch below. This `if` shows ONE example of giving a single
-        # game its own heuristic: on LS20 we bias the random pick so ACTION4
-        # is twice as likely as any other action. Add more `elif` branches to
-        # specialize other games.
-        #
-        # `self.game_id` is set by the framework. It may be the short id
-        # ("ls20") or include a version suffix ("ls20-9607627b"), so we
-        # compare on the prefix to be safe.
-        candidate_actions = [a for a in GameAction if a is not GameAction.RESET]
-        if self.game_id.split("-")[0] == "ls20":
-            weights = [2 if a is GameAction.ACTION4 else 1 for a in candidate_actions]
-            action = random.choices(candidate_actions, weights=weights, k=1)[0]
-        else:
-            action = random.choice(candidate_actions)
-        # ────────────────────────────────────────────────────────────────────
+        # Build prompt representing the current grid state and episodic memory
+        system_prompt = self.build_system_prompt()
+        user_prompt = self.build_user_prompt(latest_frame)
 
-        if action.is_complex():
-            # ACTION6 takes (x, y) coordinates on a 64×64 grid.
-            action.set_data(
-                {"x": random.randint(0, 63), "y": random.randint(0, 63)}
+        if not self.messages:
+            self.messages.append({"role": "system", "content": system_prompt})
+        
+        self.messages.append({"role": "user", "content": user_prompt})
+
+        # Trim messages if they get too long, preserving the system prompt
+        if len(self.messages) > self.MESSAGE_LIMIT:
+            self.messages = [self.messages[0]] + self.messages[-(self.MESSAGE_LIMIT-1):]
+
+        tools = self.build_tools()
+
+        try:
+            response = client.chat.completions.create(
+                model=self.MODEL,
+                messages=self.messages,
+                tools=tools,
+                tool_choice="required",
+                temperature=0.2, # Low temperature for more deterministic/logical play
             )
-            action.reasoning = {"why": "random complex action"}
-        else:
-            action.reasoning = f"random simple action: {action.value}"
+        except Exception as e:
+            logger.warning(f"LLM API Error: {e}. Falling back to Random Action.")
+            import random
+            return random.choice([a for a in GameAction if a is not GameAction.RESET])
+
+        message = response.choices[0].message
+        self.messages.append(message.model_dump())
+
+        if not message.tool_calls:
+            # Fallback if the model didn't call a tool
+            logger.warning("No tool call returned by LLM.")
+            import random
+            return random.choice([a for a in GameAction if a is not GameAction.RESET])
+
+        tool_call = message.tool_calls[0]
+        action_name = tool_call.function.name
+        arguments = tool_call.function.arguments
+
+        # Track the action for the next turn
+        self.episodic_memory.append(f"Action taken: {action_name} with args {arguments}")
+
+        try:
+            data = json.loads(arguments) if arguments else {}
+        except:
+            data = {}
+
+        action = GameAction.from_name(action_name)
+        action.set_data(data)
+        
+        # Add reasoning metadata for the scorecard logs
+        action.reasoning = {
+            "model": self.MODEL,
+            "chosen_action": action_name,
+            "args": data
+        }
+        
         return action
+
+    def build_system_prompt(self) -> str:
+        return textwrap.dedent(
+            """
+            You are an expert AI agent playing an interactive grid-based reasoning game (ARC-AGI-3).
+            Your goal is to WIN the game by completing all levels. 
+            You must carefully analyze the visual grid representations (2D arrays) provided on each turn.
+            
+            Game dynamics:
+            - The grid contains integers from 0 to 15, representing colors/objects.
+            - You can move using ACTION1 (Up), ACTION2 (Down), ACTION3 (Left), ACTION4 (Right).
+            - ACTION5 (Interact/Enter) and ACTION6 (Click) may also be available.
+            - If your action causes no change in the grid, you probably hit a wall or took an invalid action.
+            
+            Memory Strategy:
+            You must learn from previous steps. If you notice a repeated pattern of "no change", try a different direction.
+            """
+        )
+
+    def build_user_prompt(self, latest_frame: FrameData) -> str:
+        grid_repr = self.pretty_print_3d(latest_frame.frame)
+        memory = "\n".join(self.episodic_memory[-5:]) # Show last 5 episodic events
+        
+        return textwrap.dedent(
+            f"""
+            # Current State: {latest_frame.state.name}
+            # Levels Completed: {latest_frame.levels_completed}
+            
+            # Recent Memory (Last 5 events):
+            {memory if memory else "None"}
+
+            # Current Grid Observation:
+            {grid_repr}
+
+            # Instructions:
+            Analyze the grid and the memory. Determine what changed since the last action.
+            Call exactly one tool (action) to proceed.
+            """
+        )
+
+    def pretty_print_3d(self, array_3d: list[list[list[Any]]]) -> str:
+        lines = []
+        for i, block in enumerate(array_3d):
+            lines.append(f"Grid Layer {i}:")
+            for row in block:
+                # Format to align single digits with double digits for readable matrix
+                formatted_row = "[" + ", ".join(f"{val:2d}" for val in row) + "]"
+                lines.append(f"  {formatted_row}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def build_tools(self) -> list[dict[str, Any]]:
+        empty_params = {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        }
+        functions = [
+            {"name": GameAction.ACTION1.name, "description": "Move Up", "parameters": empty_params},
+            {"name": GameAction.ACTION2.name, "description": "Move Down", "parameters": empty_params},
+            {"name": GameAction.ACTION3.name, "description": "Move Left", "parameters": empty_params},
+            {"name": GameAction.ACTION4.name, "description": "Move Right", "parameters": empty_params},
+            {"name": GameAction.ACTION5.name, "description": "Interact/Spacebar", "parameters": empty_params},
+            {
+                "name": GameAction.ACTION6.name,
+                "description": "Click/Point",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "integer", "description": "X coordinate (0-63)"},
+                        "y": {"type": "integer", "description": "Y coordinate (0-63)"},
+                    },
+                    "required": ["x", "y"],
+                    "additionalProperties": False,
+                },
+            },
+        ]
+        
+        tools = []
+        for f in functions:
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": f["name"],
+                        "description": f["description"],
+                        "parameters": f.get("parameters", {}),
+                    },
+                }
+            )
+        return tools
